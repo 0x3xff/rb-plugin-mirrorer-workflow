@@ -1,6 +1,1 @@
-{
-  "$comment": "Assets to mirror. Each entry needs a numeric Creator Store asset id; name is optional and only used as a fallback label.",
-  "plugins": [
-    { "id": "96645663824840", "name": "example - replace me" }
-  ]
-}
+["96645663824840"]
