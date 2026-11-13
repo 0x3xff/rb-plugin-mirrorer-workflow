@@ -15,7 +15,7 @@ on:
         description: "If an asset is not owned but costs nothing, send the Creator Store Get request first"
         required: false
         type: boolean
-        default: false
+        default: true
       dry_run:
         description: "Check and report only - download nothing, commit nothing"
         required: false
