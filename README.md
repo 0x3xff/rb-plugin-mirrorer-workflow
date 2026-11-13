@@ -22,7 +22,6 @@ out `main` separately and pushes its commits to it.
    name `ROBLOSECURITY`, value = the whole `_|WARNING:-DO-NOT-SHARE-THIS...|_` cookie value.
 2. **Write access.** Settings → Actions → General → Workflow permissions → *Read and write*.
 3. **Default branch.** Settings → General → Default branch → switch to `workflow`.
-4. Keep the repo **private** — the mirrored `.rbxm` files are plugin source you bought.
 
 ## Using it
 
