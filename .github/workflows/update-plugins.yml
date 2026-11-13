@@ -1,10 +1,14 @@
 name: Update plugins
 
+# This workflow lives on the `workflow` branch (which must be the repository's
+# default branch, or `schedule` never fires). The plugin files and the id list
+# live on the `main` branch, checked out separately below.
+
 on:
   workflow_dispatch:
     inputs:
       asset_ids:
-        description: "Extra asset IDs to check this run (comma separated), on top of plugins.json"
+        description: "Asset ids to add (comma separated). They get appended to plugins.json. Leave empty to just re-check the existing list."
         required: false
         type: string
       acquire_free:
@@ -34,8 +38,20 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout
+      # The scripts, from this branch.
+      - name: Check out the workflow branch
         uses: actions/checkout@v4
+        with:
+          path: ci
+
+      # The mirror. Naming the ref checks out the branch as it is *now*, not the
+      # commit that triggered the run - otherwise a run queued before an earlier
+      # one pushed would work from a stale tree.
+      - name: Check out the mirror branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: mirror
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -45,40 +61,60 @@ jobs:
       - name: Check ownership and download plugins
         id: collect
         continue-on-error: true
+        working-directory: mirror
         env:
           ROBLOSECURITY: ${{ secrets.ROBLOSECURITY }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           ASSET_IDS: ${{ inputs.asset_ids }}
           ACQUIRE_FREE: ${{ inputs.acquire_free }}
           DRY_RUN: ${{ inputs.dry_run }}
           PLUGINS_FILE: plugins.json
           LOCK_FILE: plugins.lock.json
           OUT_DIR: plugins
+          CHANGED_PATHS_FILE: ${{ runner.temp }}/changed-paths.txt
           BASE_DELAY_MS: "1200"
-        run: node scripts/update-plugins.js
+        run: node ../ci/scripts/update-plugins.js
 
-      - name: Commit changed plugin files
+      - name: Commit to the mirror branch
         if: steps.collect.outputs.changed == 'true'
+        working-directory: mirror
         env:
+          PATHS_FILE: ${{ runner.temp }}/changed-paths.txt
           COMMIT_TITLE: ${{ steps.collect.outputs.commit_title }}
         run: |
           set -euo pipefail
+          test -s "$PATHS_FILE" || { echo "No paths recorded; nothing to commit."; exit 0; }
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A plugins plugins.lock.json
-          if git diff --cached --quiet; then
-            echo "Nothing staged after all; skipping commit."
-            exit 0
-          fi
-          git commit -m "${COMMIT_TITLE:-Update plugins}" -m "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          # The schedule and a manual run can land together; rebase onto whatever moved.
+
           for attempt in 1 2 3; do
-            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
-               && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            # Rebuild the commit on top of the current remote tip every attempt.
+            # reset --mixed keeps the working tree (our downloads) but points the
+            # index at the remote tree, so staging only our own paths can never
+            # conflict with, or delete, anything another run pushed meanwhile.
+            git fetch --depth=1 origin main
+            git reset --mixed FETCH_HEAD
+
+            while IFS= read -r p; do
+              [ -n "$p" ] || continue
+              if [ -e "$p" ] || git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+                git add -- "$p"
+              fi
+            done < "$PATHS_FILE"
+
+            if git diff --cached --quiet; then
+              echo "Remote already matches what this run produced; nothing to commit."
+              exit 0
+            fi
+
+            git commit -q \
+              -m "${COMMIT_TITLE:-Update plugins}" \
+              -m "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+            if git push origin HEAD:main; then
               echo "Pushed on attempt ${attempt}."
               exit 0
             fi
-            echo "Push attempt ${attempt} failed; retrying."
+            echo "Push rejected on attempt ${attempt}; refetching and rebuilding."
             sleep 5
           done
           echo "Could not push after 3 attempts." >&2

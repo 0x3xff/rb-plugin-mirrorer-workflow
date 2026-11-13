@@ -2,7 +2,15 @@
 /**
  * Roblox plugin mirror / updater.
  *
- * For every asset listed in plugins.json:
+ * plugins.json is a plain array of asset ids - the list of what to mirror:
+ *
+ *   ["96645663824840", "1234567890"]
+ *
+ * Ids passed in ASSET_IDS (the workflow's asset_ids input) are merged into that
+ * array and committed with the run, so a scheduled run re-checks everything that
+ * has been added before. Drop an id from the array to stop checking it.
+ *
+ * For each id:
  *   1. confirms the authenticated account owns it,
  *   2. downloads the asset (.rbxm / .rbxmx) through assetdelivery,
  *   3. writes it into the repo only when its bytes actually changed,
@@ -15,15 +23,15 @@
  * Node.js 18+, no npm packages.
  *
  * Env:
- *   ROBLOSECURITY     .ROBLOSECURITY cookie value          (required)
- *   PLUGINS_FILE      manifest path       (default plugins.json)
- *   LOCK_FILE         lock path           (default plugins.lock.json)
- *   OUT_DIR           download folder     (default plugins)
- *   ASSET_IDS         extra comma/space separated asset IDs to include
- *   ACQUIRE_FREE=1    buy not-owned assets that are free
- *   DRY_RUN=1         check and report, write nothing
- *   BASE_DELAY_MS     minimum pause between requests (default 1200)
- *   DISCORD_WEBHOOK   optional webhook for the run summary
+ *   ROBLOSECURITY       .ROBLOSECURITY cookie value        (required)
+ *   ASSET_IDS           comma/space separated asset ids to add or check
+ *   PLUGINS_FILE        id list path         (default plugins.json)
+ *   LOCK_FILE           lock path            (default plugins.lock.json)
+ *   OUT_DIR             download folder      (default plugins)
+ *   ACQUIRE_FREE=1      buy not-owned assets that are free
+ *   DRY_RUN=1           check and report, write nothing
+ *   BASE_DELAY_MS       minimum pause between requests (default 1200)
+ *   CHANGED_PATHS_FILE  write the paths this run touched here, one per line
  */
 
 "use strict";
@@ -36,11 +44,11 @@ const COOKIE = (process.env.ROBLOSECURITY || "").trim();
 const PLUGINS_FILE = process.env.PLUGINS_FILE || "plugins.json";
 const LOCK_FILE = process.env.LOCK_FILE || "plugins.lock.json";
 const OUT_DIR = process.env.OUT_DIR || "plugins";
-const EXTRA_IDS = (process.env.ASSET_IDS || "").split(/[\s,;]+/).filter((s) => /^\d+$/.test(s));
+const INPUT_IDS = (process.env.ASSET_IDS || "").split(/[\s,;]+/).filter((s) => /^\d+$/.test(s));
 const ACQUIRE_FREE = process.env.ACQUIRE_FREE === "1" || process.env.ACQUIRE_FREE === "true";
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 const BASE_DELAY_MS = Number(process.env.BASE_DELAY_MS || 1200);
-const WEBHOOK = (process.env.DISCORD_WEBHOOK || "").trim();
+const CHANGED_PATHS_FILE = (process.env.CHANGED_PATHS_FILE || "").trim();
 
 const DETAILS_URL = "https://apis.roblox.com/toolbox-service/v1/items/details";
 const PURCHASE_URL = "https://apis.roblox.com/marketplace-fiat-service/v1/product/purchase";
@@ -191,26 +199,39 @@ function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
 }
 
-// Accepts  ["123", 456]  or  [{ id, name? }]  or  { plugins: [...] }
-function loadManifest() {
+// plugins.json is a plain array of ids. Ids from the input are merged in and the
+// file is rewritten so the next scheduled run keeps checking them.
+function loadIds() {
   const raw = readJson(PLUGINS_FILE, null);
-  if (!raw && EXTRA_IDS.length === 0) {
-    throw new Error(`no assets to check: ${PLUGINS_FILE} is missing or unreadable and ASSET_IDS is empty`);
-  }
-  const list = Array.isArray(raw) ? raw : Array.isArray(raw?.plugins) ? raw.plugins : [];
-  const out = new Map();
-  for (const entry of list) {
-    const e = typeof entry === "object" && entry !== null ? entry : { id: entry };
-    const id = String(e.id ?? "").trim();
-    if (!/^\d+$/.test(id)) {
-      log(`Skipping manifest entry without a numeric id: ${JSON.stringify(entry)}`);
-      continue;
+  const listed = [];
+  if (raw !== null) {
+    if (!Array.isArray(raw)) {
+      throw new Error(`${PLUGINS_FILE} must be a JSON array of asset ids, e.g. ["96645663824840"]`);
     }
-    out.set(id, { id, name: e.name ? String(e.name) : null });
+    for (const v of raw) {
+      const id = String(v).trim();
+      if (/^\d+$/.test(id)) listed.push(id);
+      else log(`Ignoring non-numeric entry in ${PLUGINS_FILE}: ${JSON.stringify(v)}`);
+    }
   }
-  for (const id of EXTRA_IDS) if (!out.has(id)) out.set(id, { id, name: null });
-  if (out.size === 0) throw new Error("no valid asset IDs found");
-  return [...out.values()];
+
+  const ids = [...new Set([...listed, ...INPUT_IDS])];
+  if (ids.length === 0) {
+    throw new Error(
+      `nothing to check: pass ids in the asset_ids input (ASSET_IDS) or add them to ${PLUGINS_FILE}`
+    );
+  }
+
+  const added = ids.filter((id) => !listed.includes(id));
+  if (added.length && !DRY_RUN) {
+    const sorted = [...ids].sort();
+    fs.writeFileSync(PLUGINS_FILE, JSON.stringify(sorted, null, 2) + "\n");
+    touched.add(PLUGINS_FILE);
+    log(`Added to ${PLUGINS_FILE}: ${added.join(", ")}`);
+  } else if (added.length) {
+    log(`Would add to ${PLUGINS_FILE}: ${added.join(", ")}`);
+  }
+  return ids;
 }
 
 const slug = (s) =>
@@ -219,14 +240,27 @@ const slug = (s) =>
 // Binary rbxm starts with "<roblox!", the XML form with "<roblox ...>".
 const extFor = (buf) => (buf.toString("latin1", 0, 8) === "<roblox!" ? ".rbxm" : ".rbxmx");
 
+// Paths this run created, overwrote or deleted - the commit step stages exactly these.
+const touched = new Set();
+let pluginFilesChanged = 0;
+
 function writeOutput(relPath, buf) {
   const full = path.join(process.cwd(), relPath);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, buf);
+  touched.add(relPath);
+  pluginFilesChanged++;
 }
 
 function removeOutput(relPath) {
-  try { fs.unlinkSync(path.join(process.cwd(), relPath)); return true; } catch { return false; }
+  try {
+    fs.unlinkSync(path.join(process.cwd(), relPath));
+    touched.add(relPath);
+    pluginFilesChanged++;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -236,11 +270,10 @@ function removeOutput(relPath) {
 const results = [];
 let hardFailures = 0;
 
-async function handle(entry, me, lock) {
-  const id = entry.id;
+async function handle(id, me, lock) {
   const prev = lock.plugins[id] || null;
   const details = await itemDetails(id);
-  const name = details?.name || entry.name || prev?.name || `asset-${id}`;
+  const name = details?.name || prev?.name || `asset-${id}`;
   const record = { id, name, status: "", note: "" };
 
   let owned = await isOwned(me.id, id);
@@ -364,31 +397,14 @@ function writeSummary(me) {
     try {
       fs.appendFileSync(
         process.env.GITHUB_OUTPUT,
-        `changed=${changed.length > 0 && !DRY_RUN}\n` +
+        `changed=${touched.size > 0 && !DRY_RUN}\n` +
           `changed_count=${changed.length}\n` +
           `failures=${hardFailures}\n` +
           `commit_title=${title.replace(/[\r\n]+/g, " ")}\n`
       );
     } catch {}
   }
-  return { headline, changed };
-}
-
-async function postWebhook(content) {
-  if (!WEBHOOK) return;
-  try {
-    await fetch(WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: "Plugin Updater",
-        content: content.slice(0, 1900),
-        allowed_mentions: { parse: [] },
-      }),
-    });
-  } catch (e) {
-    log(`Webhook post failed: ${e.message}`);
-  }
+  return headline;
 }
 
 async function main() {
@@ -397,26 +413,26 @@ async function main() {
     process.exit(1);
   }
 
-  const entries = loadManifest();
   const lock = readJson(LOCK_FILE, null) || { updatedAt: null, plugins: {} };
   if (!lock.plugins || typeof lock.plugins !== "object") lock.plugins = {};
+  const ids = loadIds();
 
   const me = await whoAmI();
   log(`Logged in as ${me.name} (${me.id})`);
   log(
-    `${entries.length} asset(s) to check | mode: ${DRY_RUN ? "DRY RUN" : "write"} | ` +
+    `${ids.length} asset(s) to check | mode: ${DRY_RUN ? "DRY RUN" : "write"} | ` +
       `acquire free: ${ACQUIRE_FREE ? "on" : "off"}`
   );
 
-  for (const entry of entries) {
+  for (const id of ids) {
     try {
-      await handle(entry, me, lock);
+      await handle(id, me, lock);
     } catch (e) {
       hardFailures++;
-      log(`ERROR on ${entry.id}: ${e.message}`);
+      log(`ERROR on ${id}: ${e.message}`);
       results.push({
-        id: entry.id,
-        name: entry.name || `asset-${entry.id}`,
+        id,
+        name: lock.plugins[id]?.name || `asset-${id}`,
         status: "error",
         note: String(e.message).slice(0, 160),
       });
@@ -427,21 +443,18 @@ async function main() {
     lock.updatedAt = new Date().toISOString();
     lock.account = { id: me.id, name: me.name };
     fs.writeFileSync(LOCK_FILE, JSON.stringify(lock, null, 2) + "\n");
+    // Only worth committing when a plugin file moved; otherwise the lock would
+    // produce a daily commit of nothing but refreshed timestamps.
+    if (pluginFilesChanged > 0) touched.add(LOCK_FILE);
   }
 
-  const { headline, changed } = writeSummary(me);
+  if (CHANGED_PATHS_FILE) {
+    fs.writeFileSync(CHANGED_PATHS_FILE, [...touched].join("\n") + (touched.size ? "\n" : ""));
+  }
+
+  const headline = writeSummary(me);
   log(`Done: ${headline}`);
-
-  if (changed.length || hardFailures) {
-    await postWebhook(
-      [
-        changed.length ? `**${changed.length} plugin file(s) changed**` : `**${hardFailures} problem(s)**`,
-        ...results
-          .filter((r) => !["unchanged", "not-owned"].includes(r.status))
-          .map((r) => `- \`${r.status}\` [${r.name}](${storeUrl(r.id)})${r.note ? ` - ${r.note}` : ""}`),
-      ].join("\n")
-    );
-  }
+  if (touched.size) log(`Paths to commit:\n  ${[...touched].join("\n  ")}`);
 
   // Files and the lock are already on disk, so the commit step can still run.
   if (hardFailures) process.exit(2);
