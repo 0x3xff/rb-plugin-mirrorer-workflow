@@ -1,0 +1,22 @@
+{
+  "updatedAt": "2026-11-13T16:35:28.547Z",
+  "plugins": {
+    "96645663824840": {
+      "id": "96645663824840",
+      "name": "Sine VFX",
+      "creator": "RoPotat0",
+      "file": "plugins/Sine-VFX-96645663824840.rbxm",
+      "size": 1372670,
+      "sha256": "73e6c45fa3a74d2673ace0f38ef7b3773361013fffff3152d173ea23d21b0104",
+      "assetUpdatedUtc": "2026-11-13T01:06:59.768Z",
+      "firstSeen": "2026-11-13T16:35:28.547Z",
+      "lastChanged": "2026-11-13T16:35:28.547Z",
+      "lastChecked": "2026-11-13T16:35:28.547Z",
+      "storeUrl": "https://create.roblox.com/store/asset/96645663824840"
+    }
+  },
+  "account": {
+    "id": 4798509951,
+    "name": "QezzarAlt"
+  }
+}
